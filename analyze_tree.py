@@ -13,7 +13,7 @@ def start_engine(stockfish_path, search_time):
     Spawn a new uci engine from the given path.
     """
     engine = chess.uci.popen_engine(stockfish_path)
-    engine.setoption({'Threads': 4})
+    engine.setoption({'Threads': 5})
     info_handler = chess.uci.InfoHandler()
     engine.info_handlers.append(info_handler)
     engine.uci()
@@ -161,9 +161,6 @@ def make_pv_tree(htree, etree, n):
     while n != 0 and q:
         # Get and add node from heap
         mlogp, _, p, move, board, subtree = heapq.heappop(q)
-        #print(mlogp, p, move.uci(), 'queue:')
-        #for (mlogp1, _, p1, move1, board1, _) in q:
-            #print(mlogp1, p1, move1.uci())
         n -= 1
         sub2tree = []
         subtree.append((p, move, sub2tree))
@@ -205,7 +202,7 @@ def most_common(board, htree):
     res = []
     total = 0
     for move in board.legal_moves:
-        cnt = htree[hash((board._transposition_key(), move))]
+        cnt = htree[hash((hash(board._transposition_key()), move))]
         if cnt != 0:
             res.append((cnt, move))
             total += cnt
