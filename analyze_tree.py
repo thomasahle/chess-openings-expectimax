@@ -107,22 +107,32 @@ class GameDatabase:
 
 
 class Expectimax:
-    def __init__(self, engine, database, treshold):
+    def __init__(self, engine, database, color, treshold):
         self.engine = engine
         self.treshold = treshold
         self.database = database
+        self.color = chess.WHITE if color == 'white' else chess.BLACK
         self.etree = {}
 
-    def search(self, board=None):
+    def search(self):
+        if self.color == chess.WHITE:
+            self.__search(chess.Board())
+        else:
+            board = chess.Board()
+            score = 0
+            for p, move in self.most_common(board):
+                board.push(move)
+                score += p*self.__search(board)
+                board.pop()
+            self.etree[hash(board._transposition_key())] = (None, score)
+        # search uses \r, so we want a free line to keep the last output
+        print()
+
+    def __search(self, board):
         """
         Perform expectimax. Could also use mcts.
         Search is always called from the perspective of ourselves
         """
-
-        if board is None:
-            is_root = True
-            board = chess.Board()
-        else: is_root = False
 
         root_key = hash(board._transposition_key())
 
@@ -160,7 +170,7 @@ class Expectimax:
                 denom = 0
                 for opp_move in board.legal_moves:
                     board.push(opp_move)
-                    val = self.search(board)
+                    val = self.__search(board)
                     board.pop()
                     # We use a Laplace smoothing, adding 1 to each move.
                     move_cnt = self.database.get_move_count(board, opp_move) + 1
@@ -174,10 +184,6 @@ class Expectimax:
                 best_move = move
                 best_score = score
 
-        # search uses \r, so we want a free line to keep the last output
-        if is_root:
-            print()
-
         self.etree[root_key] = (best_move, best_score)
         return best_score
 
@@ -186,30 +192,37 @@ class Expectimax:
 
     def __inner_pv_tree(self, pv_tree, board, indent, has_siblings):
         for p, move, subtree in pv_tree:
-            if board.turn == chess.BLACK:
-                print(indent, f'{board.san(move)}: {p:.2f}')
+            if move is None:
+                print(indent, f'Score: {p:.2f}')
             else:
-                print(indent, f'{board.san(move)}. Score: {p:.2f}')
-            board.push(move)
+                if board.turn == self.color:
+                    print(indent, f'{board.san(move)}. Score: {p:.2f}')
+                else:
+                    print(indent, f'{board.san(move)} ({p:.2f})')
+                board.push(move)
             subindent = indent + (' | ' if has_siblings else ' '*3)
-            self.__inner_pv_tree(subtree, board, subindent, has_siblings=len(subtree) > 1)
-            board.pop()
+            self.__inner_pv_tree(subtree, board, subindent,
+                                 has_siblings=len(subtree) > 1)
+            if move is not None:
+                board.pop()
 
     def __make_pv_tree(self, n):
         """
         n is the number nodes in the tree
         """
+        q = [] # (-logp, p, random, move, board, tree-where-it-should-live)
         board = chess.Board()
         move, score = self.etree[hash(board._transposition_key())]
         subtree = []
         tree = [(score, move, subtree)]
-        q = [] # (-logp, p, random, move, board, tree-where-it-should-live)
-        board.push(move)
+        if move is not None:
+            # If we are black, the first move is None
+            assert self.color == chess.BLACK
+            board.push(move)
         for pp, move in self.most_common(board):
             board.push(move)
             heapq.heappush(q, (-math.log(pp), random.random(), pp, move, board.copy(), subtree))
             board.pop()
-        board.pop()
 
         while n != 0 and q:
             # Get and add node from heap
@@ -268,6 +281,7 @@ class ChessOpeningsExpectimax:
         parser.add_argument('--ms', default=50, type=int, help='Miliseconds to search each leaf node')
         parser.add_argument('--threads', default=4, type=int, help='Threads to use for engine')
         parser.add_argument('--treesize', default=50, type=int, help='Number of nodes to include in pv tree')
+        parser.add_argument('--color', default='white', type=str, help='Side from which to analyze')
         args = parser.parse_args()
 
         max_year = datetime.datetime.now().year
@@ -279,9 +293,9 @@ class ChessOpeningsExpectimax:
 
     def process_date(self, year, month, database, args):
         htree_path = f'htree_{year}_{month}.pkl'
-        etree_path = f'etree_{year}_{month}.pkl'
+        etree_path = f'etree_{args.color}_{year}_{month}.pkl'
         engine = Engine(args.engine, args.ms, args.threads)
-        searcher = Expectimax(engine, database, args.treshold)
+        searcher = Expectimax(engine, database, args.color, args.treshold)
 
         if os.path.isfile(htree_path):
             print(f'Loading htree from {htree_path}')
@@ -301,7 +315,7 @@ class ChessOpeningsExpectimax:
             searcher.load(etree_path)
         else:
             engine.start()
-            print('Making engine tree...')
+            print(f'Making engine tree for {args.color}...')
             searcher.search()
             print(f'Saving to {etree_path}...')
             searcher.dump(etree_path)
@@ -312,5 +326,6 @@ class ChessOpeningsExpectimax:
 
 if __name__ == '__main__':
     ChessOpeningsExpectimax().main()
+
 
 
