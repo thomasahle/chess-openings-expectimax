@@ -188,7 +188,8 @@ class Expectimax:
         return best_score
 
     def print_pv_tree(self, n):
-        self.__inner_pv_tree(self.__make_pv_tree(n), chess.Board(), '', False)
+        self.__inner_pv_tree(self.__make_pv_tree(n), chess.Board(), indent='',
+                             has_siblings=False)
 
     def __inner_pv_tree(self, pv_tree, board, indent, has_siblings):
         for p, move, subtree in pv_tree:
@@ -211,43 +212,36 @@ class Expectimax:
         n is the number nodes in the tree
         """
         q = [] # (-logp, p, random, move, board, tree-where-it-should-live)
-        board = chess.Board()
-        move, score = self.etree[hash(board._transposition_key())]
-        subtree = []
-        tree = [(score, move, subtree)]
-        if move is not None:
-            # If we are black, the first move is None
-            assert self.color == chess.BLACK
-            board.push(move)
-        for pp, move in self.most_common(board):
-            board.push(move)
-            heapq.heappush(q, (-math.log(pp), random.random(), pp, move, board.copy(), subtree))
-            board.pop()
+        tree = []
+        self.__push_children(q, tree, 0, chess.Board())
 
         while n != 0 and q:
             # Get and add node from heap
             mlogp, _, p, move, board, subtree = heapq.heappop(q)
-            n -= 1
             sub2tree = []
             subtree.append((p, move, sub2tree))
-            # Get and add response node
-            key = hash(board._transposition_key())
-            if key not in self.etree:
-                continue
-            move, score = self.etree[key]
-            if move is None:
-                continue
-            sub3tree = []
-            sub2tree.append((score, move, sub3tree))
-            # Add response-response nodes to heap
-            board.push(move)
-            for pp, move in self.most_common(board):
-                board.push(move)
-                heapq.heappush(q, (mlogp - math.log(pp), random.random(), pp, move, board.copy(), sub3tree))
-                board.pop()
-            board.pop()
+            self.__push_children(q, sub2tree, mlogp, board)
+            n -= 1
 
         return tree
+
+    def __push_children(self, q, tree, mlogp, board):
+        # Get and add response node
+        key = hash(board._transposition_key())
+        if key not in self.etree: return
+        move, score = self.etree[key]
+        #if move is None and not ignore_none: return
+        subtree = []
+        tree.append((score, move, subtree))
+        # If we are at the root, the move is a null-move (changing the color
+        # from black to white) so we don't push it.
+        if move is not None:
+            board.push(move)
+        # Add response-response nodes to heap
+        for pp, move in self.most_common(board):
+            board.push(move)
+            heapq.heappush(q, (mlogp - math.log(pp), random.random(), pp, move, board.copy(), subtree))
+            board.pop()
 
     def most_common(self, board):
         res = []
