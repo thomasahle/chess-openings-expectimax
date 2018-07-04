@@ -1,7 +1,7 @@
 # Chess Openings with Expectimax
 In real chess, our opponent doesn't always play the best move.
 Given a large database of games, we may expect they play according to the emperical probability distribution of what other players did in the same situation.
-Consequently the right algorithm for chess search is not minimax, but expectimax.
+Consequently the right algorithm for chess search is not minimax, but [expectimax](https://www.youtube.com/watch?v=jaFRyzp7yWw).
 That is, we want to optimize the expected outcome out of the opening.
 
 This project uses the lichess database to perform such an analysis of the chess opening game.
