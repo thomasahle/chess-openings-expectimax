@@ -1,5 +1,5 @@
-import chess, chess.pgn, chess.uci
-import bz2, requests
+import chess, chess.pgn, chess.engine
+import bz2, requests, gzip
 import collections, heapq
 import os.path, pickle
 import math, random
@@ -12,17 +12,14 @@ class Engine:
         Spawn a new uci engine from the given path.
         """
         self.engine = None
-        self.info_handler = chess.uci.InfoHandler()
         self.search_time = search_time
         self.threads = threads
         self.ucipath = ucipath
         self.evals = 0
 
     def start(self):
-        self.engine = chess.uci.popen_engine(self.ucipath)
-        self.engine.setoption({'Threads': self.threads})
-        self.engine.info_handlers.append(self.info_handler)
-        self.engine.uci()
+        self.engine = chess.engine.SimpleEngine.popen_uci(self.ucipath)
+        self.engine.configure({'Threads': self.threads})
 
     def evaluate(self, board):
         """
@@ -31,14 +28,11 @@ class Engine:
         of the current player in the range [-1, 1].
         """
         self.evals += 1
-        self.engine.position(board)
-        move, ponder = self.engine.go(movetime=self.search_time)
-        score = self.info_handler.info['score'][1]
-        if score.cp is not None:
-            return move, 2/(1 + 10**(-score.cp/400)) - 1
-        if score.mate > 0:
-            return move, 1
-        return move, -1
+        info = self.engine.analyse(board, chess.engine.Limit(time=self.search_time))
+        wp = info['score'].relative.wdl().expectation()
+        #wp = 2/(1 + 10**(-cp/400)) - 1
+        move = info['pv'][0]
+        return move, wp
 
 
 class GameDatabase:
@@ -47,36 +41,39 @@ class GameDatabase:
     def __init__(self):
         self.htree = collections.Counter()
 
-    def download_games(self, year, month, max_games):
+    def download_games(self, year, month, max_games, filters):
         """
         Download and parsse lichess games from year, month.
         """
-        r = requests.get(self.archive_url.format(year=year, month=month), stream=True)
-        with bz2.open(r.raw, 'rt') as b:
-            for _ in range(max_games):
-                try:
-                    game = chess.pgn.read_game(b)
-                # read_game is supposed to return None if there are not more games,
-                # but sometimes it appears to throw an EOFError instead.
-                except EOFError:
-                    break
-                if game is None:
-                    break
-                yield game
-                #welo = game.headers['WhiteElo']
-                #belo = game.headers['BlackElo']
-                #tc = game.headers['TimeControl']
+        url = self.archive_url.format(year=year, month=month)
+        # For some reason the lichess server now defaults to gzipping the bzip
+        headers = {'Accept-Encoding': 'identity'}
+        with requests.get(url, headers=headers, stream=True) as r:
+            r.raise_for_status()
+            with bz2.open(r.raw, 'rt') as b:
+                for _ in range(max_games):
+                    try:
+                        game = chess.pgn.read_game(b)
+                    # read_game is supposed to return None if there are not more games,
+                    # but sometimes it appears to throw an EOFError instead.
+                    except EOFError:
+                        break
+                    if game is None:
+                        break
+                    if not all(f(game.headers) for f in filters):
+                        continue
+                    yield game
 
-    def update_tree(self, year, month, max_games):
+    def update_tree(self, year, month, max_games, filters):
         """
         Add games to a position -> visits counter.
         """
-        games = self.download_games(year, month, max_games)
+        games = self.download_games(year, month, max_games, filters)
         for i, game in enumerate(games):
             board = game.board()
             if i % 1000 == 0:
                 print(i, 'games processed', end='\r')
-            for j, move in enumerate(game.main_line()):
+            for j, move in enumerate(game.mainline_moves()):
                 key = hash(board._transposition_key())
                 self.htree[key] += 1
                 self.htree[hash((key, move))] += 1
@@ -115,6 +112,7 @@ class Expectimax:
         self.etree = {}
 
     def search(self):
+        """ Travels the tree top-down, evaluating the scores, storing them in etree """
         if self.color == chess.WHITE:
             self.__search(chess.Board())
         else:
@@ -276,6 +274,10 @@ class ChessOpeningsExpectimax:
         parser.add_argument('--threads', default=4, type=int, help='Threads to use for engine')
         parser.add_argument('--treesize', default=50, type=int, help='Number of nodes to include in pv tree')
         parser.add_argument('--color', default='white', type=str, help='Side from which to analyze')
+        parser.add_argument('--min-rating', default=0, type=int, help='Lowest rating for players')
+        parser.add_argument('--max-rating', default=10000, type=int, help='Highest rating for players')
+        parser.add_argument('--min-tc', default=0, type=int, help='Shortest time control (in seconds) to include')
+        parser.add_argument('--max-tc', default=10000, type=int, help='Longest time control (in seconds) to include')
         args = parser.parse_args()
 
         max_year = datetime.datetime.now().year
@@ -288,8 +290,28 @@ class ChessOpeningsExpectimax:
     def process_date(self, year, month, database, args):
         htree_path = f'htree_{year}_{month}.pkl'
         etree_path = f'etree_{args.color}_{year}_{month}.pkl'
-        engine = Engine(args.engine, args.ms, args.threads)
+        engine = Engine(args.engine, args.ms/1000, args.threads)
         searcher = Expectimax(engine, database, args.color, args.treshold)
+
+        def header_filter(headers):
+            welo, belo = headers['WhiteElo'], headers['BlackElo']
+            if not welo.isdigit() or not belo.isdigit():
+                #print('Warning; non digit elos:', welo, belo)
+                return False
+            welo, belo = int(welo), int(belo)
+            if not args.min_rating <= welo <= args.max_rating \
+                    or not args.min_rating <= belo <= args.max_rating:
+                return False
+            # This is important the same way rating filters are.
+            if not '+' in headers['TimeControl']:
+                # print('Warning: Odd tc', headers['TimeControl'])
+                return False
+            else:
+                time, incr = headers['TimeControl'].split('+')
+                secs = int(time) + 40*int(incr)
+                if not args.min_tc <= secs <= args.max_tc:
+                    return False
+            return True
 
         if os.path.isfile(htree_path):
             print(f'Loading htree from {htree_path}')
@@ -300,7 +322,7 @@ class ChessOpeningsExpectimax:
                 print(f'Removing {etree_path}')
                 os.remove(etree_path)
             print('Making human tree from download...')
-            database.update_tree(year, month, args.games)
+            database.update_tree(year, month, args.games, [header_filter])
             print(f'Saving to {htree_path}...')
             database.dump(htree_path)
 
