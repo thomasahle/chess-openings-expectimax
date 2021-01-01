@@ -25,12 +25,11 @@ class Engine:
         """
         Evaluate the board using the given engine.
         Returns the best move as well as the score from the perspective
-        of the current player in the range [-1, 1].
+        of the current player in the range [0, 1].
         """
         self.evals += 1
         info = self.engine.analyse(board, chess.engine.Limit(time=self.search_time))
         wp = info['score'].relative.wdl().expectation()
-        #wp = 2/(1 + 10**(-cp/400)) - 1
         move = info['pv'][0]
         return move, wp
 
@@ -71,12 +70,12 @@ class GameDatabase:
         games = self.download_games(year, month, max_games, filters)
         for i, game in enumerate(games):
             board = game.board()
-            if i % 1000 == 0:
+            if i % 10 == 0:
                 print(i, 'games processed', end='\r')
             for j, move in enumerate(game.mainline_moves()):
-                key = hash(board._transposition_key())
+                key = board._transposition_key()
                 self.htree[key] += 1
-                self.htree[hash((key, move))] += 1
+                self.htree[(key, move)] += 1
                 # We only allow a game to contribute one new position.
                 # This prevents our RAM from filling up with otherwise unseen
                 # positions, while not affecting useful posistions much.
@@ -87,12 +86,12 @@ class GameDatabase:
         # TODO: Consider trimming the tree by removing all nodes with less
 
     def get_board_count(self, board):
-        key = hash(board._transposition_key())
+        key = board._transposition_key()
         return self.htree[key]
 
     def get_move_count(self, board, move):
-        key = hash(board._transposition_key())
-        return self.htree[hash((key, move))]
+        key = board._transposition_key()
+        return self.htree[(key, move)]
 
     def dump(self, path):
         with open(path, 'wb') as f:
@@ -122,7 +121,7 @@ class Expectimax:
                 board.push(move)
                 score += p*self.__search(board)
                 board.pop()
-            self.etree[hash(board._transposition_key())] = (None, score)
+            self.etree[board._transposition_key()] = (None, score)
         # search uses \r, so we want a free line to keep the last output
         print()
 
@@ -132,7 +131,7 @@ class Expectimax:
         Search is always called from the perspective of ourselves
         """
 
-        root_key = hash(board._transposition_key())
+        root_key = board._transposition_key()
 
         if root_key in self.etree:
             value = self.etree[root_key]
@@ -185,6 +184,24 @@ class Expectimax:
         self.etree[root_key] = (best_move, best_score)
         return best_score
 
+    def make_pgn(self, n):
+        """ Makes a pgn, including the `n` most common nodes of the tree. """
+        game = chess.pgn.Game()
+        game.headers['Event'] = 'Expectimax analysis'
+        self.__inner_make_pgn(self.__make_pv_tree(n), game)
+        return game
+
+    def __inner_make_pgn(self, pv_tree, node):
+        for score_or_p, move, subtree in pv_tree:
+            assert move is not None
+            board = node.board()
+            new_node = node.add_variation(move)
+            if board.turn == self.color:
+                new_node.comment = f'Score: {2*score_or_p-1:.2f}'
+            else:
+                new_node.comment = f'Probability: {score_or_p:.2f}'
+            self.__inner_make_pgn(subtree, new_node)
+
     def print_pv_tree(self, n):
         self.__inner_pv_tree(self.__make_pv_tree(n), chess.Board(), indent='',
                              has_siblings=False)
@@ -195,9 +212,9 @@ class Expectimax:
                 print(indent, f'Score: {p:.2f}')
             else:
                 if board.turn == self.color:
-                    print(indent, f'{board.san(move)}. Score: {p:.2f}')
+                    print(indent, f'{board.san(move)}. Score: {2*p-1:.2f}')
                 else:
-                    print(indent, f'{board.san(move)} ({p:.2f})')
+                    print(indent, f'{board.san(move)} (p={p:.2f})')
                 board.push(move)
             subindent = indent + (' | ' if has_siblings else ' '*3)
             self.__inner_pv_tree(subtree, board, subindent,
@@ -207,7 +224,7 @@ class Expectimax:
 
     def __make_pv_tree(self, n):
         """
-        n is the number nodes in the tree
+        Only incluedes the `n` most likely nodes in the tree.
         """
         q = [] # (-logp, p, random, move, board, tree-where-it-should-live)
         tree = []
@@ -217,6 +234,9 @@ class Expectimax:
             # Get and add node from heap
             mlogp, _, p, move, board, subtree = heapq.heappop(q)
             sub2tree = []
+            # It's kinda odd: Here I add (p, move, subtree), but
+            # in __push_children I add (score, move, ...). Probably this can
+            # be done more elegantly.
             subtree.append((p, move, sub2tree))
             self.__push_children(q, sub2tree, mlogp, board)
             n -= 1
@@ -224,8 +244,12 @@ class Expectimax:
         return tree
 
     def __push_children(self, q, tree, mlogp, board):
+        """ Let board be a node with our turn to play.
+            Adds (score, move, subtree) to the tree, and then pushes all follow up
+            moves to the heap with a reference to the subtree, so they can be expanded
+            later on. """
         # Get and add response node
-        key = hash(board._transposition_key())
+        key = board._transposition_key()
         if key not in self.etree: return
         move, score = self.etree[key]
         #if move is None and not ignore_none: return
@@ -242,6 +266,8 @@ class Expectimax:
             board.pop()
 
     def most_common(self, board):
+        """ Returns a list of (proability of play, move) pairs for the given position,
+            based on the used GameDatabase. """
         res = []
         total = 0
         for move in board.legal_moves:
@@ -315,7 +341,9 @@ class ChessOpeningsExpectimax:
 
         if os.path.isfile(htree_path):
             print(f'Loading htree from {htree_path}')
+            size_prior = len(database.htree)
             database.load_update(htree_path)
+            print(f'Loaded {len(database.htree) - size_prior} nodes')
         else:
             # If we redo htree we also have to redo etree
             if os.path.isfile(etree_path):
@@ -328,7 +356,9 @@ class ChessOpeningsExpectimax:
 
         if os.path.isfile(etree_path):
             print(f'Loading etree from {etree_path}')
+            size_prior = len(searcher.etree)
             searcher.load(etree_path)
+            print(f'Loaded {len(searcher.etree) - size_prior} nodes')
         else:
             engine.start()
             print(f'Making engine tree for {args.color}...')
@@ -338,6 +368,15 @@ class ChessOpeningsExpectimax:
 
         print('Making pv tree')
         searcher.print_pv_tree(args.treesize)
+
+        print('Saving pgn analysis')
+        pgn_game = searcher.make_pgn(50*args.treesize)
+        for i in range(10**6):
+            fn = f'analysis.pgn.{i}'
+            if os.path.isfile(fn):
+                continue
+            print(pgn_game, file=open(fn,'w'), end='\n\n')
+            break
 
 
 if __name__ == '__main__':
