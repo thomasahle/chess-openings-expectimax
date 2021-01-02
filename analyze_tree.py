@@ -3,7 +3,7 @@ import bz2, requests, gzip
 import collections, heapq
 import os.path, pickle
 import math, random
-import argparse, datetime
+import argparse, datetime, urllib
 
 
 class Engine:
@@ -56,6 +56,10 @@ class GameDatabase:
                     # read_game is supposed to return None if there are not more games,
                     # but sometimes it appears to throw an EOFError instead.
                     except EOFError:
+                        print('Warning: EOFError')
+                        break
+                    except ConnectionResetError:
+                        print('Warning: ConnectionResetError')
                         break
                     if game is None:
                         break
@@ -68,10 +72,10 @@ class GameDatabase:
         Add games to a position -> visits counter.
         """
         games = self.download_games(year, month, max_games, filters)
+        i = -1 # In case there are no games
         for i, game in enumerate(games):
             board = game.board()
-            if i % 10 == 0:
-                print(i, 'games processed', end='\r')
+            print(i, 'games processed', end='\r')
             for j, move in enumerate(game.mainline_moves()):
                 key = board._transposition_key()
                 self.htree[key] += 1
@@ -193,13 +197,17 @@ class Expectimax:
 
     def __inner_make_pgn(self, pv_tree, node):
         for score_or_p, move, subtree in pv_tree:
-            assert move is not None
-            board = node.board()
-            new_node = node.add_variation(move)
-            if board.turn == self.color:
-                new_node.comment = f'Score: {2*score_or_p-1:.2f}'
+            if move is None:
+                # This only happens at the root, and only when we're black
+                node.comment = f'Score: {2*score_or_p-1:.2f}'
+                new_node = node
             else:
-                new_node.comment = f'Probability: {score_or_p:.2f}'
+                board = node.board()
+                new_node = node.add_variation(move)
+                if board.turn == self.color:
+                    new_node.comment = f'Score: {2*score_or_p-1:.2f}'
+                else:
+                    new_node.comment = f'Probability: {score_or_p:.2f}'
             self.__inner_make_pgn(subtree, new_node)
 
     def print_pv_tree(self, n):
@@ -209,6 +217,7 @@ class Expectimax:
     def __inner_pv_tree(self, pv_tree, board, indent, has_siblings):
         for p, move, subtree in pv_tree:
             if move is None:
+                # This only happens at the root, and only when we're black
                 print(indent, f'Score: {p:.2f}')
             else:
                 if board.turn == self.color:
@@ -311,11 +320,22 @@ class ChessOpeningsExpectimax:
         for year in range(2013, max_year+1):
             for month in range(1, 13):
                 if (year, month) < (args.year, args.month): continue
+                print(f'\n{month} - {year}')
                 self.process_date(year, month, database, args)
 
     def process_date(self, year, month, database, args):
-        htree_path = f'htree_{year}_{month}.pkl'
-        etree_path = f'etree_{args.color}_{year}_{month}.pkl'
+        arg_dict = args.__dict__.copy()
+        arg_dict['year'] = year
+        arg_dict['month'] = month
+        for arg in ['engine', 'threads', 'treesize']:
+            del arg_dict[arg]
+        arg_str = urllib.parse.urlencode(arg_dict)
+
+        # TODO: There is no reason to include color=... in the htree path, since it
+        # is the same from both sides
+        htree_path = f'htree_{arg_str}.pkl' 
+        etree_path = f'etree_{arg_str}.pkl'
+        analysis_path = f'analysis_{arg_str}.pgn'
         engine = Engine(args.engine, args.ms/1000, args.threads)
         searcher = Expectimax(engine, database, args.color, args.treshold)
 
@@ -371,12 +391,7 @@ class ChessOpeningsExpectimax:
 
         print('Saving pgn analysis')
         pgn_game = searcher.make_pgn(50*args.treesize)
-        for i in range(10**6):
-            fn = f'analysis.pgn.{i}'
-            if os.path.isfile(fn):
-                continue
-            print(pgn_game, file=open(fn,'w'), end='\n\n')
-            break
+        print(pgn_game, file=open(analysis_path,'w'), end='\n\n')
 
 
 if __name__ == '__main__':
