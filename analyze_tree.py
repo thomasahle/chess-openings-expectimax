@@ -4,6 +4,7 @@ import collections, heapq
 import os.path, pickle
 import math, random
 import argparse, datetime, urllib
+import asyncio
 
 
 class Engine:
@@ -26,11 +27,18 @@ class Engine:
         Evaluate the board using the given engine.
         Returns the best move as well as the score from the perspective
         of the current player in the range [0, 1].
+        If no move is returned by the engine, the move is None.
         """
         self.evals += 1
-        info = self.engine.analyse(board, chess.engine.Limit(time=self.search_time))
+        try:
+            info = self.engine.analyse(board, chess.engine.Limit(time=self.search_time))
+        except asyncio.exceptions.TimeoutError:
+            print('Warning: Timeout in analysis')
+            return None, 0
         wp = info['score'].relative.wdl().expectation()
-        move = info['pv'][0]
+        if 'pv' in info:
+            move = info['pv'][0]
+        else: move = None
         return move, wp
 
 
@@ -61,6 +69,10 @@ class GameDatabase:
                     except ConnectionResetError:
                         print('Warning: ConnectionResetError')
                         break
+                    except ValueError as ve:
+                        # Up to August 2016: 7 games with illegal castling moves were recorded.
+                        print('Warning: ValueError', ve)
+                        continue
                     if game is None:
                         break
                     if not all(f(game.headers) for f in filters):
@@ -87,7 +99,6 @@ class GameDatabase:
                     break
                 board.push(move)
         print(i+1, 'games processed')
-        # TODO: Consider trimming the tree by removing all nodes with less
 
     def get_board_count(self, board):
         key = board._transposition_key()
@@ -143,7 +154,10 @@ class Expectimax:
             # No reason to break this in the probabilistically correct way
             if value == 'open':
                 move, score = self.engine.evaluate(board)
-                self.etree[root_key] = (move, score)
+                # We don't store "None" moves in the etree.
+                # That would confuse us later on.
+                if move is not None:
+                    self.etree[root_key] = (move, score)
                 return score
             best_move, best_score = value
             return best_score
@@ -152,7 +166,8 @@ class Expectimax:
 
         if self.database.get_board_count(board) < self.treshold:
             move, score = self.engine.evaluate(board)
-            self.etree[root_key] = (move, score)
+            if move is not None:
+                self.etree[root_key] = (move, score)
             return score
 
         print(self.engine.evals, '...', end='\r')
